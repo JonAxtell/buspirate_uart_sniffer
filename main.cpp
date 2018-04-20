@@ -35,6 +35,8 @@
 #include <iostream>
 #include <iomanip>
 #include <cerrno>
+#include <cstring>
+#include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -44,22 +46,37 @@
 #include <time.h>
 #include <sys/time.h>
 
+int uart;
 std::string port;
+bool verbose;
+bool livemonitor;
 unsigned int timeout;
 unsigned int outputwidth;
 unsigned int devicebaud;
 unsigned int devicedata;
 char deviceparity;
 unsigned int devicestop;
+std::string deviceprotocol;
+struct timeval programstart;
+struct timeval interpackettimer;
+uint32_t previouspackettime;
 
-struct timeval timer;
+//#############################################################################
+// Timer functions
+//
 
-void StartTimer(void)
+//-----------------------------------------------------------------------------
+// Start a timer
+//
+void StartTimer(struct timeval &timer)
 {
     gettimeofday(&timer, NULL);
 }
 
-unsigned int TimeElapsedInMilliseconds(void)
+//-----------------------------------------------------------------------------
+// Get time elapsed since the timer was started
+//
+unsigned int TimeElapsedInMilliseconds(struct timeval &timer)
 {
     struct timeval now;
 
@@ -67,6 +84,20 @@ unsigned int TimeElapsedInMilliseconds(void)
     return ((now.tv_sec - timer.tv_sec) * 1000) + ((now.tv_usec - timer.tv_usec) / 1000);
 }
 
+//-----------------------------------------------------------------------------
+// Get current time
+//
+unsigned int TimeInMilliseconds(void)
+{
+    struct timeval now;
+
+    gettimeofday(&now, NULL);
+    return (now.tv_sec * 1000) + (now.tv_usec  / 1000);
+}
+
+//#############################################################################
+// Set the serial port
+//
 // Baud can be B50/B75/B110/B134/B150/B200/B300/B600/B1200/B1800/B2400/B4800/
 //              B9600/B19200/B38400/B57600/B115200/B230400/B460800/B576000/
 //              B921600/B1000000/B1152000/B1500000/B2000000/B2500000/
@@ -74,13 +105,13 @@ unsigned int TimeElapsedInMilliseconds(void)
 // Data can be CS5/CS6/CS7/CS8
 // Parity can be PARENB | PARODD for odd, PARENB for even, 0 for none
 // Stop is 0 for 1 stop, CSTOPB for 2 stop bits
+//
 bool SetInterface(int handle, int baud, int data, int parity, int stop)
 {
     struct termios tty;
 
     if (tcgetattr(handle, &tty) < 0)
     {
-        std::cerr << "UART: Error " << errno << " from tcgetattr" << std::endl;
         return false;
     }
 
@@ -107,13 +138,15 @@ bool SetInterface(int handle, int baud, int data, int parity, int stop)
 
     if (tcsetattr(handle, TCSANOW, &tty) < 0)
     {
-        std::cerr << "UART: Error " << errno << " from tcsetattr" << std::endl;
         return false;
     }
 
     return true;
 }
 
+//#############################################################################
+// Receive and throw away a CR LF sequence
+//
 bool EatCRLF(int handle)
 {
     char buffer[32];
@@ -133,6 +166,9 @@ bool EatCRLF(int handle)
     return true;
 }
 
+//#############################################################################
+// Send command to Bus Pirate
+//
 bool SendCommand(int handle, const char *command)
 {
     char buffer[32];
@@ -140,7 +176,7 @@ bool SendCommand(int handle, const char *command)
     // Send the command
     if (strlen(command) > 0)
     {
-        std::cout << "Sending command [" << command << "]" << std::endl;
+        if (verbose) std::cout << "Sending command [" << command << "]" << std::endl;
         write(handle, command, strlen(command));
 
         // Eat the echo
@@ -162,6 +198,9 @@ bool SendCommand(int handle, const char *command)
     return EatCRLF(handle);
 }
 
+//#############################################################################
+// Wait for specified prompt from Bus Pirate
+//
 bool GetPrompt(int handle, const char *prompt)
 {
     char buffer[32];
@@ -190,6 +229,9 @@ bool GetPrompt(int handle, const char *prompt)
     return true;
 }
 
+//#############################################################################
+// Convert buad rate to index used by Bus Pirate
+//
 int BaudRateIndex(unsigned int baud)
 {
     static const unsigned int rates[] = {
@@ -214,6 +256,9 @@ int BaudRateIndex(unsigned int baud)
     return -1;
 }
 
+//#############################################################################
+// Convert data bits and parity to index used by Bus Pirate
+//
 int DataParityIndex(unsigned int data, char parity)
 {
     if ((data == 8) && (parity == 'N'))
@@ -235,6 +280,9 @@ int DataParityIndex(unsigned int data, char parity)
     return -1;
 }
 
+//#############################################################################
+// Convert stop bits to index used by Bus Pirate
+//
 int StopBitsIndex(unsigned int stop)
 {
     if (stop == 1)
@@ -248,39 +296,56 @@ int StopBitsIndex(unsigned int stop)
     return -1;
 }
 
+//#############################################################################
+// Output usage/help
+//
 void Usage(void)
 {
     std::cout << "buspirate_uart_sniffer -p <port> [options] [device options]" << std::endl;
     std::cout << std::endl;
     std::cout << "Options:" << std::endl;
-    std::cout << "  -w   Width of output (default 16 bytes)" << std::endl;
-    std::cout << "  -t   Inter packet timeout (default is 50ms)" << std::endl;
+    std::cout << "  -w <width>  Width of output (default 16 bytes)" << std::endl;
+    std::cout << "  -t <time>   Interpacket timeout (default is 50ms)" << std::endl;
+    std::cout << "  -l          Already in Live monitor mode" << std::endl;
+    std::cout << "  -v          Verbose output" << std::endl;
     std::cout << std::endl;
     std::cout << "Device options:" << std::endl;
-    std::cout << "  -B   Baudrate (default is 9600)" << std::endl;
-    std::cout << "  -D   Data bits (8 or 9)" << std::endl;
-    std::cout << "  -P   Parity (N, E, or O)" << std::endl;
-    std::cout << "  -S   Stop bits (1 or 2)" << std::endl;
+    std::cout << "  -C <protocol>  Communication protocol" << std::endl;
+    std::cout << "  -B <baud>      Baudrate (default is 9600)" << std::endl;
+    std::cout << "  -D <data>      Data bits (8 or 9)" << std::endl;
+    std::cout << "  -P <parity>    Parity (N, E, or O)" << std::endl;
+    std::cout << "  -S <stop>      Stop bits (1 or 2)" << std::endl;
     std::cout << std::endl;
     std::cout << "Default is 9600 8N1 with 50ms timeout and 16 bytes per line." << std::endl;
     std::cout << "Recognised baud rates for the device are 300, 1200, 2400, 4800" << std::endl <<
-                 "  9600, 19200, 38400, 57600, 115200" << std::endl;
+                 "9600, 19200, 38400, 57600, 115200" << std::endl;
+    std::cout << "Communication protocols are RP80, ccTalk, SSP, SAS, BACTA." << std::endl <<
+                 "Each packet will start on a new line. If no protocol is specified" << std::endl <<
+                 "the interpacket timeout will be used." << std::endl;
 }
 
+//#############################################################################
+// Process command line arguments
+//
+// Returns false if invalid argument, missing option, etc.
+//
 bool ProcessCommandLineArguments(int argc, char *argv[])
 {
     bool passed = true;
 
+    deviceprotocol = "";
     devicebaud = 9600;
     devicedata = 8;
     deviceparity = 'N';
     devicestop = 1;
     outputwidth = 16;
-    timeout = 50;
+    timeout = 0;
+    verbose = false;
+    livemonitor = false;
 
     opterr = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "hp:w:t:B:D:P:S:")) != -1)
+    while ((opt = getopt(argc, argv, "hvlp:w:t:C:B:D:P:S:")) != -1)
     {
         switch (opt)
         {
@@ -292,7 +357,7 @@ bool ProcessCommandLineArguments(int argc, char *argv[])
             case 'p':
             {
                 port = optarg;
-                std::cout << "Port is " << port << std::endl;
+//                std::cout << "Port is " << port << std::endl;
                 break;
             }
             case 'w':
@@ -303,7 +368,7 @@ bool ProcessCommandLineArguments(int argc, char *argv[])
                     std::cerr << "Width is between 8 and 64" << std::endl;
                     passed = false;
                 }
-                std::cout << "Width is " << outputwidth << std::endl;
+//                std::cout << "Width is " << outputwidth << std::endl;
                 break;
             }
             case 't':
@@ -314,7 +379,31 @@ bool ProcessCommandLineArguments(int argc, char *argv[])
                     std::cerr << "Timeout limit is 10000ms (10s)" << std::endl;
                     passed = false;
                 }
-                std::cout << "Timeout is " << timeout << std::endl;
+//                std::cout << "Timeout is " << timeout << std::endl;
+                break;
+            }
+            case 'v':
+            {
+                verbose = true;
+//                std::cout << "Verbose is " << verbose << std::endl;
+                break;
+            }
+            case 'l':
+            {
+                livemonitor = true;
+//                std::cout << "Live monitor mode is " << livemonitor << std::endl;
+                break;
+            }
+            case 'C':
+            {
+                deviceprotocol = optarg;
+                std::transform(deviceprotocol.begin(), deviceprotocol.end(), deviceprotocol.begin(), [](unsigned char c) -> unsigned char { return std::toupper(c); });
+                if ((deviceprotocol.compare("RP80") != 0) && (deviceprotocol.compare("CCTALK") != 0) && (deviceprotocol.compare("SSP") != 0) && (deviceprotocol.compare("SAS") != 0) && (deviceprotocol.compare("BACTA") != 0))
+                {
+                    std::cerr << "Protocols are RP80, ccTalk, SSP, SAS, BACTA" << std::endl;
+                    passed = false;
+                }
+//                std::cout << "Protocol is " << deviceprotocol << std::endl;
                 break;
             }
             case 'B':
@@ -325,7 +414,7 @@ bool ProcessCommandLineArguments(int argc, char *argv[])
                     std::cerr << "Baudrates are 300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200" << std::endl;
                     passed = false;
                 }
-                std::cout << "Baud rate is " << devicebaud << std::endl;
+//                std::cout << "Baud rate is " << devicebaud << std::endl;
                 break;
             }
             case 'D':
@@ -336,7 +425,7 @@ bool ProcessCommandLineArguments(int argc, char *argv[])
                     std::cerr << "Databits is 8 or 9" << std::endl;
                     passed = false;
                 }
-                std::cout << "Data bits is " << devicedata << std::endl;
+//                std::cout << "Data bits is " << devicedata << std::endl;
                 break;
             }
             case 'P':
@@ -347,7 +436,7 @@ bool ProcessCommandLineArguments(int argc, char *argv[])
                     std::cerr << "Parity is None, Even, or Odd" << std::endl;
                     passed = false;
                 }
-                std::cout << "Parity is " << deviceparity << std::endl;
+//                std::cout << "Parity is " << deviceparity << std::endl;
                 break;
             }
             case 'S':
@@ -358,7 +447,7 @@ bool ProcessCommandLineArguments(int argc, char *argv[])
                     std::cerr << "Stop bits is 1 or 2" << std::endl;
                     passed = false;
                 }
-                std::cout << "Stop bits is " << devicestop << std::endl;
+//                std::cout << "Stop bits is " << devicestop << std::endl;
                 break;
             }
             case ':':
@@ -394,6 +483,224 @@ bool ProcessCommandLineArguments(int argc, char *argv[])
     return passed;
 }
 
+//#############################################################################
+// Send a sequence of command to put the Bus Pirate into UART Live Monitor mode
+//
+bool ConfigureBusPirate(void)
+{
+    int retry;
+    for (retry = 0; retry < 10; ++retry)
+    {
+        SendCommand(uart, "m 1");
+        if (GetPrompt(uart, "HiZ>"))
+        {
+            if (verbose) std::cout << "At HiZ prompt" << std::endl;
+            break;
+        }
+        else
+        {
+            if (verbose) std::cout << "Not at HiZ prompt, trying to get to main menu" << std::endl;
+        }
+    }
+    if (retry == 10)
+    {
+        close(uart);
+        return false;
+    }
+
+    if (verbose) std::cout << "Selecting menu" << std::endl;
+
+    SendCommand(uart, "m");
+    if (!GetPrompt(uart, "(1)>"))
+    {
+        close(uart);
+        return false;
+    }
+
+    if (verbose) std::cout << "Selecting uart mode" << std::endl;
+
+    SendCommand(uart, "3");
+    if (!GetPrompt(uart, "(1)>"))
+    {
+        close(uart);
+        return false;
+    }
+
+    if (verbose) std::cout << "Selecting " << devicebaud << " baud" << std::endl;
+
+    char buffer[32];
+    sprintf(buffer, "%d", BaudRateIndex(devicebaud));
+    SendCommand(uart, buffer);
+    if (!GetPrompt(uart, "(1)>"))
+    {
+        close(uart);
+        return false;
+    }
+
+    if (verbose) std::cout << "Selecting " << devicedata << " data bits & " << deviceparity << " parity" << std::endl;
+
+    sprintf(buffer, "%d", DataParityIndex(devicedata, deviceparity));
+    SendCommand(uart, buffer);
+    if (!GetPrompt(uart, "(1)>"))
+    {
+        close(uart);
+        return false;
+    }
+
+    if (verbose) std::cout << "Selecting " << devicestop << " stop bits" << std::endl;
+
+    sprintf(buffer, "%d", StopBitsIndex(devicestop));
+    SendCommand(uart, buffer);
+    if (!GetPrompt(uart, "(1)>"))
+    {
+        close(uart);
+        return false;
+    }
+
+    if (verbose) std::cout << "Selecting normal polarity" << std::endl;
+
+    SendCommand(uart, "1");
+    if (!GetPrompt(uart, "(1)>"))
+    {
+        close(uart);
+        return false;
+    }
+
+    if (verbose) std::cout << "Selecting open drain type" << std::endl;
+
+    SendCommand(uart, "1");
+    if (!GetPrompt(uart, "UART>"))
+    {
+        close(uart);
+        return false;
+    }
+
+    if (verbose) std::cout << "In UART mode, selecting live monitor" << std::endl;
+
+    SendCommand(uart, "(2)");
+    if (!GetPrompt(uart, "Any key to exit"))
+    {
+        close(uart);
+        return false;
+    }
+
+    EatCRLF(uart);
+    return true;
+}
+
+//#############################################################################
+// Parse incoming data and indicate when a RP80 packet has started
+//
+bool ParseRP80Packet(unsigned char ch)
+{
+    const uint8_t TX_STX1 = 0x7F;
+    const uint8_t TX_STX2 = 0x7E;
+    const uint8_t RX_STX1 = 0x7D;
+    const uint8_t RX_STX2 = 0x7C;
+    static enum { STATE_STX1, STATE_STX2, STATE_LEN, STATE_DATA, STATE_CHECKSUM } state = STATE_STX1;
+    static unsigned char buffer[128];
+    static int i = 0;
+    static int len = 0;
+
+    switch (state)
+    {
+        case STATE_STX1:
+        {
+            if ((ch == TX_STX1) || (ch == RX_STX1))
+            {
+                state = STATE_STX2;
+                return true;
+            }
+            else
+            {
+                state = STATE_STX1;
+            }
+            break;
+        }
+        case STATE_STX2:
+        {
+            if ((ch == TX_STX2) || (ch == RX_STX2))
+            {
+                state = STATE_LEN;
+            }
+            else
+            {
+                state = STATE_STX1;
+            }
+            break;
+        }
+        case STATE_LEN:
+        {
+            len = ch;
+            i = 0;
+            state = STATE_DATA;
+            break;
+        }
+        case STATE_DATA:
+        {
+            buffer[i] = ch;
+            if (++i >= len)
+            {
+                state = STATE_CHECKSUM;
+            }
+            break;
+        }
+        case STATE_CHECKSUM:
+        {
+            unsigned char cksum;
+            for (int i = 0; i < len; ++i)
+            {
+                cksum ^= buffer[i];
+            }
+            if (cksum == ch)
+            {
+                // We don't care about checksum being valid here.
+            }
+            state = STATE_STX1;
+        }
+    }
+    return false;
+}
+
+//#############################################################################
+// Parse incoming data and indicate when a ccTalk packet has started
+//
+bool ParseCCTalkPacket(unsigned char ch)
+{
+    (void)ch;
+    return false;
+}
+
+//#############################################################################
+// Parse incoming data and indicate when a SSP packet has started
+//
+bool ParseSSPPacket(unsigned char ch)
+{
+    (void)ch;
+    return false;
+}
+
+//#############################################################################
+// Parse incoming data and indicate when a SAS packet has started
+//
+bool ParseSASPacket(unsigned char ch)
+{
+    (void)ch;
+    return false;
+}
+
+//#############################################################################
+// Parse incoming data and indicate when a BACTA packet has started
+//
+bool ParseBACTAPacket(unsigned char ch)
+{
+    (void)ch;
+    return false;
+}
+
+//#############################################################################
+// Main superloop
+//
 int main(int argc, char *argv[])
 {
     if (argc == 1)
@@ -406,150 +713,105 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    int _uart = open(port.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
-    if (_uart < 0)
+    uart = open(port.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
+    if (uart < 0)
     {
-        std::cerr << "Failed to open serial port " << port << std::endl;
+        std::cerr << "Failed to open serial port " << port << ", " << std::strerror(errno) << std::endl;
         return EXIT_FAILURE;
     }
 
-    if (!SetInterface(_uart, B115200, CS8, 0, 0))
+    if (!SetInterface(uart, B115200, CS8, 0, 0))
     {
-        std::cerr << "Failed to set serial port settings on " << port << std::endl;
+        std::cerr << "Failed to set serial port settings on " << port << ", " << std::strerror(errno) << std::endl;
     }
 
-    int retry;
-    for (retry = 0; retry < 10; ++retry)
+    if (!livemonitor)
     {
-        SendCommand(_uart, "m 1");
-        if (GetPrompt(_uart, "HiZ>"))
+        if (!ConfigureBusPirate())
         {
-            std::cout << "At HiZ prompt" << std::endl;
-            break;
-        }
-        else
-        {
-            std::cout << "Not at HiZ prompt, trying to get to main menu" << std::endl;
+            return EXIT_FAILURE;
         }
     }
-    if (retry == 10)
-    {
-        close(_uart);
-        return EXIT_FAILURE;
-    }
 
-    std::cout << "Selecting menu" << std::endl;
-
-    SendCommand(_uart, "m");
-    if (!GetPrompt(_uart, "(1)>"))
-    {
-        close(_uart);
-        return EXIT_FAILURE;
-    }
-
-    std::cout << "Selecting uart mode" << std::endl;
-
-    SendCommand(_uart, "3");
-    if (!GetPrompt(_uart, "(1)>"))
-    {
-        close(_uart);
-        return EXIT_FAILURE;
-    }
-
-    std::cout << "Selecting " << devicebaud << " baud" << std::endl;
-
-    char buffer[32];
-    sprintf(buffer, "%d", BaudRateIndex(devicebaud));
-    SendCommand(_uart, buffer);
-    if (!GetPrompt(_uart, "(1)>"))
-    {
-        close(_uart);
-        return EXIT_FAILURE;
-    }
-
-    std::cout << "Selecting " << devicedata << " data bits & " << deviceparity << " parity" << std::endl;
-
-    sprintf(buffer, "%d", DataParityIndex(devicedata, deviceparity));
-    SendCommand(_uart, buffer);
-    if (!GetPrompt(_uart, "(1)>"))
-    {
-        close(_uart);
-        return EXIT_FAILURE;
-    }
-
-    std::cout << "Selecting " << devicestop << " stop bits" << std::endl;
-
-    sprintf(buffer, "%d", StopBitsIndex(devicestop));
-    SendCommand(_uart, buffer);
-    if (!GetPrompt(_uart, "(1)>"))
-    {
-        close(_uart);
-        return EXIT_FAILURE;
-    }
-
-    std::cout << "Selecting normal polarity" << std::endl;
-
-    SendCommand(_uart, "1");
-    if (!GetPrompt(_uart, "(1)>"))
-    {
-        close(_uart);
-        return EXIT_FAILURE;
-    }
-
-    std::cout << "Selecting open drain type" << std::endl;
-
-    SendCommand(_uart, "1");
-    if (!GetPrompt(_uart, "UART>"))
-    {
-        close(_uart);
-        return EXIT_FAILURE;
-    }
-
-    std::cout << "In UART mode, selecting live monitor" << std::endl;
-
-    SendCommand(_uart, "(2)");
-    if (!GetPrompt(_uart, "Any key to exit"))
-    {
-        close(_uart);
-        return EXIT_FAILURE;
-    }
-
-    EatCRLF(_uart);
-    std::cout << "In live monitor mode" << std::endl;
+    std::cout << "In live monitor mode." << std::endl <<
+                 "Use Ctrl-C to quit. The Bus Pirate will need resetting after use." << std::endl;
 
     char ch;
     unsigned int b;
     unsigned int i;
-    StartTimer();
+    StartTimer(interpackettimer);
+    StartTimer(programstart);
+    bool newline = true;
     while (1)
     {
-        if (read(_uart, &ch, 1) == 1)
+        if (read(uart, &ch, 1) == 1)
         {
-            // First check if time since last byte is longer than the inter packet timeout
-            if ((timeout != 0) && (TimeElapsedInMilliseconds() > timeout))
+            // If full packet has been received or interpacket timeout reached, then we can start a new line
+            if (!deviceprotocol.empty())
             {
+                if (deviceprotocol.compare("RP80") == 0)
+                {
+                    if (ParseRP80Packet(ch))
+                    {
+                        newline = true;
+                    }
+                }
+                else if (deviceprotocol.compare("CCTALK") == 0)
+                {
+                    if (ParseCCTalkPacket(ch))
+                    {
+                        newline = true;
+                    }
+                }
+                else if (deviceprotocol.compare("SSP") == 0)
+                {
+                    if (ParseSSPPacket(ch))
+                    {
+                        newline = true;
+                    }
+                }
+                else if (deviceprotocol.compare("SAS") == 0)
+                {
+                    if (ParseSASPacket(ch))
+                    {
+                        newline = true;
+                    }
+                }
+                else if (deviceprotocol.compare("BACTA") == 0)
+                {
+                    if (ParseBACTAPacket(ch))
+                    {
+                        newline = true;
+                    }
+                }
+            }
+            else if (timeout != 0)
+            {
+                if (TimeElapsedInMilliseconds(interpackettimer) > timeout)
+                {
+                    newline = true;
+                }
+            }
+
+            // Have we reached our width per line, start a new line anyway
+            if (i > outputwidth)
+            {
+                newline = true;
+            }
+
+            // If a new line started because of inter packet timeout or width reached, output the byte offset
+            if (newline)
+            {
+                newline = false;
+                previouspackettime = TimeElapsedInMilliseconds(interpackettimer);
+                StartTimer(interpackettimer);
                 if (i != 0)
                 {
                     // Start a new line ready for the byte offset
                     std::cout << std::endl;
                 }
                 i = 0;
-            }
-
-            // Set time byte was received
-            StartTimer();
-
-            // Have we reached our width per line
-            if (i > outputwidth)
-            {
-                std::cout << std::endl;
-                i = 0;
-            }
-
-            // If a new line started because of inter packet timeout or width reached, output the byte offset
-            if (i == 0)
-            {
-                std::cout << std::hex << std::setfill('0') << std::setw(8) << b << ": " << std::dec;
+                std::cout << std::setfill(' ') << std::setw(6) << previouspackettime << " " << std::hex << std::setfill('0') << std::setw(8) << b << ": " << std::dec;
             }
 
             // Output the byte
@@ -560,6 +822,6 @@ int main(int argc, char *argv[])
             ++b;
         }
     }
-    close(_uart);
+    close(uart);
     return EXIT_SUCCESS;
 }
